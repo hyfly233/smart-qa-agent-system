@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -64,8 +65,11 @@ class SemanticCache:
             except (ImportError, AttributeError):
                 pass
 
-        # 本地回退（写穿式缓存）
-        self._local_store: list[tuple[str, str, np.ndarray, str]] = []  # (query, answer, vec, citations_json)
+        # 本地回退（写穿式缓存，OrderedDict 实现真 LRU）
+        from smart_qa.config import settings
+        self._lru_capacity: int = settings.cache_lru_capacity
+        self._local_store: OrderedDict[str, tuple[str, np.ndarray, str]] = OrderedDict()
+        # key=query, value=(answer, vec, citations_json)
 
         if self.redis:
             logger.info(
@@ -115,12 +119,11 @@ class SemanticCache:
         if r is not None:
             await self._store_redis(r, query, answer, vec_1d, citations_json)
 
-        # 写穿：本地也存一份，减少 Redis 读放大
-        from smart_qa.config import settings
-
-        self._local_store.append((query, answer, vec_1d, citations_json))
-        if len(self._local_store) > settings.cache_lru_capacity:
-            self._local_store.pop(0)
+        # 写穿：本地也存一份，减少 Redis 读放大（OrderedDict 实现 LRU）
+        self._local_store[query] = (answer, vec_1d, citations_json)
+        self._local_store.move_to_end(query)  # 标记为最新使用
+        if len(self._local_store) > self._lru_capacity:
+            self._local_store.popitem(last=False)  # 踢最久未用的，O(1)
 
     async def clear(self):
         """清空所有缓存（生产慎用）"""
@@ -208,18 +211,21 @@ class SemanticCache:
         best_score = -1.0
         best_answer: str | None = None
         best_citations: list = []
+        best_query: str | None = None
 
-        for _stored_query, answer, stored_vec, citations_json in self._local_store:
+        for stored_query, (answer, stored_vec, citations_json) in self._local_store.items():
             score = self.embedding.cosine_similarity(query_vec[0], stored_vec)
             if score > best_score:
                 best_score = score
                 best_answer = answer
+                best_query = stored_query
                 try:
                     best_citations = json.loads(citations_json)
                 except Exception:
                     best_citations = []
 
-        if best_score >= self.threshold:
+        if best_score >= self.threshold and best_query is not None:
+            self._local_store.move_to_end(best_query)  # LRU: 标记为刚用过
             logger.info("本地缓存命中 score={:.3f}", best_score)
             return {"answer": best_answer, "citations": best_citations}
         return None
